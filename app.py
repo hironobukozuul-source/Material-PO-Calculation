@@ -212,45 +212,42 @@ def generate_plot(df_tasks, start_date, sg_cap_map, display_unit):
     buf = BytesIO(); plt.savefig(buf, format='png'); plt.close(); buf.seek(0)
     return buf
 
-# --- BOM分解エンジン (PO_check_app Logic) ---
+# --- バグ修正版：BOM分解エンジン ---
 def explode_sku_to_materials(parent_sku, volume_pcs, df_cu, df_du):
-    """
-    Given a single SKU and its evaluated pieces volume, calculates child components breakdown
-    based on DU and CU tables. Returns a dictionary of {Component_Number: (Description, Qty)}
-    """
     materials = {}
     if df_du is None or df_du.empty:
         return materials
         
     p_sku_clean = str(parent_sku).strip()
     
-    # 1. Match OUTER items from DU list
-    matched_du_outer = df_du[(df_du.iloc[:, 0].astype(str).str.strip() == p_sku_clean) & 
-                             (df_du.iloc[:, 2].astype(str).str.upper().str.contains("OUTER"))]
+    # 【修正点】数値インデックスではなく正確なカラム名文字でマッチングを実施
+    matched_du_outer = df_du[(df_du['Parent material number'].astype(str).str.strip() == p_sku_clean) & 
+                             (df_du['Component Description'].astype(str).str.upper().str.contains("OUTER"))]
     
     for _, row in matched_du_outer.iterrows():
-        comp_no = str(row.iloc[1]).strip()
-        comp_desc = str(row.iloc[2]).strip()
+        comp_no = str(row['Component Number']).strip()
+        comp_desc = str(row['Component Description']).strip()
         try:
-            parent_mat_qty = float(row.iloc[3])
+            parent_mat_qty = float(row['Parent Material Quantity'])
             if parent_mat_qty > 0:
                 needed_qty = round(volume_pcs / parent_mat_qty)
                 materials[comp_no] = (comp_desc, needed_qty)
         except Exception:
             continue
 
-    # 2. Match CU records via DU pointer
-    matched_du_cu = df_du[(df_du.iloc[:, 0].astype(str).str.strip() == p_sku_clean) & 
-                          (df_du.iloc[:, 2].astype(str).str.upper().str.contains("_GRID|_CU"))]
+    # 【修正点】_CU、_GRID を含むレコードを名前基準で抽出
+    matched_du_cu = df_du[(df_du['Parent material number'].astype(str).str.strip() == p_sku_clean) & 
+                          ((df_du['Component Description'].astype(str).str.upper().str.contains("_CU")) | 
+                           (df_du['Component Description'].astype(str).str.upper().str.contains("_GRID")))]
     
     if not matched_du_cu.empty and df_cu is not None and not df_cu.empty:
-        cu_no = str(matched_du_cu.iloc[0, 1]).strip()
-        matched_cu = df_cu[(df_cu.iloc[:, 0].astype(str).str.strip() == cu_no) & 
-                           (df_cu.iloc[:, 2].astype(str).str.upper().str.contains("PC"))]
+        cu_no = str(matched_du_cu.iloc[0]['Component Number']).strip()
+        matched_cu = df_cu[(df_cu['Parent material number'].astype(str).str.strip() == cu_no) & 
+                           (df_cu['Component Description'].astype(str).str.upper().str.contains("PC"))]
         
         for _, row in matched_cu.iterrows():
-            c_no = str(row.iloc[1]).strip()
-            c_desc = str(row.iloc[2]).strip()
+            c_no = str(row['Component Number']).strip()
+            c_desc = str(row['Component Description']).strip()
             materials[c_no] = (c_desc, volume_pcs)
             
     return materials
@@ -264,9 +261,9 @@ st.sidebar.header("⚙️ 構成設定")
 display_unit = st.sidebar.radio("Dashboard Gantt Display Unit Mode:", ["Tonnage (t)", "Pieces (pcs)"])
 
 st.sidebar.markdown("---")
-st.sidebar.header("📦 SAP 資材分解用マスター (オプション)")
-cu_file = st.sidebar.file_uploader("CU一覧ファイルをアップロード (.xlsx)", type=["xlsx"])
-du_file = st.sidebar.file_uploader("DU一覧ファイルをアップロード (.xlsx)", type=["xlsx"])
+st.sidebar.header("📦 SAP 資材分解用マスター (必須)")
+cu_file = st.sidebar.file_uploader("CU一覧ファイルをアップロード (.xlsx)", type=["xlsx", "csv"])
+du_file = st.sidebar.file_uploader("DU一覧ファイルをアップロード (.xlsx)", type=["xlsx", "csv"])
 
 st.markdown("### 1. 生産計画マスターファイルの読み込み")
 uploaded_file = st.file_uploader("Excelファイルをアップロード (.xlsm)", type=["xlsm"])
@@ -278,11 +275,19 @@ if uploaded_file:
     if sg_cap_map:
         st.sidebar.success(f"Loaded {len(sg_cap_map)} entries from SG-CAP!")
         
-    df_cu = pd.read_excel(cu_file) if cu_file else None
-    df_du = pd.read_excel(du_file) if du_file else None
+    # 各種拡張子に対応した読み込み処理
+    if cu_file:
+        if cu_file.name.endswith('.csv'): df_cu = pd.read_csv(cu_file)
+        else: df_cu = pd.read_excel(cu_file)
+    else: df_cu = None
+
+    if du_file:
+        if du_file.name.endswith('.csv'): df_du = pd.read_csv(du_file)
+        else: df_du = pd.read_excel(du_file)
+    else: df_du = None
     
     if df_cu is not None and df_du is not None:
-        st.sidebar.success("✅ SAP CU & DU マスターを検知しました！Hourly_Materialsシートが生成されます。")
+        st.sidebar.success("✅ SAP CU & DU マスターを検知しました！")
 
     available_weeks = get_available_weeks(df_raw)
     if available_weeks:
@@ -326,10 +331,8 @@ if uploaded_file:
                     c2 = ws_pcs.cell(1, 3 + i, header_str)
                     c2.font = Font(bold=True); c2.alignment = Alignment(text_rotation=90, horizontal='center')
 
-                # 時系列マトリクスデータ構造体の初期化
                 volume_matrix_data = []
                 
-                # 高速マトリクス展開ループ
                 for r_idx, (line, product) in enumerate(unique_items):
                     row_num = r_idx + 2
                     ws_vol.cell(row_num, 1, line); ws_vol.cell(row_num, 2, product)
@@ -369,7 +372,7 @@ if uploaded_file:
                     
                     volume_matrix_data.append({'line': line, 'product': product, 'hourly_pcs': row_hourly_pcs})
 
-                # 3. Hourly_Materials 新規出力シート (CU & DU 連携ロジック)
+                # 3. Hourly_Materials 出力
                 if df_cu is not None and df_du is not None:
                     ws_mat = wb.create_sheet("Hourly_Materials")
                     ws_mat.cell(1, 1, "Line").font = Font(bold=True)
@@ -389,7 +392,6 @@ if uploaded_file:
                         product = item['product']
                         hourly_pcs = item['hourly_pcs']
                         
-                        # 代表値となる1万個ベースで子資材を探索
                         sample_breakdown = explode_sku_to_materials(product, 10000, df_cu, df_du)
                         
                         for mat_code, (mat_desc, _) in sample_breakdown.items():
@@ -401,7 +403,6 @@ if uploaded_file:
                             has_values = False
                             for c_idx, pcs_val in enumerate(hourly_pcs):
                                 if pcs_val > 0:
-                                    # 再計算してタイムマトリクスに展開
                                     current_breakdown = explode_sku_to_materials(product, pcs_val, df_cu, df_du)
                                     if mat_code in current_breakdown:
                                         actual_mat_qty = current_breakdown[mat_code][1]
@@ -413,11 +414,10 @@ if uploaded_file:
                             if has_values:
                                 mat_row_idx += 1
                             else:
-                                # 行に値がない場合は上書きして詰める
                                 for clear_col in range(1, 5):
                                     ws_mat.cell(mat_row_idx, clear_col, None)
 
-                # グリッド区切り線の適用
+                # 罫線レイアウト調整
                 for ws in wb.worksheets:
                     if ws.title == "Visual_Schedule": continue
                     start_offset_col = 5 if ws.title == "Hourly_Materials" else 3
