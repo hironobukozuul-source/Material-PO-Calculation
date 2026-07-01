@@ -212,17 +212,25 @@ def generate_plot(df_tasks, start_date, sg_cap_map, display_unit):
     buf = BytesIO(); plt.savefig(buf, format='png'); plt.close(); buf.seek(0)
     return buf
 
-# --- BOM分解エンジン ---
+# --- バグ修正版：名前および詳細部分文字列マッチング対応BOM分解エンジン ---
 def explode_sku_to_materials(parent_sku, volume_pcs, df_cu, df_du):
     materials = {}
     if df_du is None or df_du.empty:
         return materials
         
-    p_sku_clean = str(parent_sku).strip()
+    p_sku_clean = str(parent_sku).strip().upper()
     
-    matched_du_outer = df_du[(df_du['Parent material number'].astype(str).str.strip() == p_sku_clean) & 
-                             (df_du['Component Description'].astype(str).str.upper().str.contains("OUTER"))]
+    # 修正：Shorthand名がParent Material Description、またはParent Material Numberそのものに部分一致するか確認
+    matched_du = df_du[
+        (df_du['Parent Material Description'].astype(str).str.upper().str.contains(p_sku_clean, na=False)) |
+        (df_du['Parent material number'].astype(str).str.upper().str.contains(p_sku_clean, na=False))
+    ]
     
+    if matched_du.empty:
+        return materials
+
+    # OUTER資材の抽出
+    matched_du_outer = matched_du[matched_du['Component Description'].astype(str).str.upper().str.contains("OUTER", na=False)]
     for _, row in matched_du_outer.iterrows():
         comp_no = str(row['Component Number']).strip()
         comp_desc = str(row['Component Description']).strip()
@@ -234,23 +242,25 @@ def explode_sku_to_materials(parent_sku, volume_pcs, df_cu, df_du):
         except Exception:
             continue
 
-    matched_du_cu = df_du[(df_du['Parent material number'].astype(str).str.strip() == p_sku_clean) & 
-                          ((df_du['Component Description'].astype(str).str.upper().str.contains("_CU")) | 
-                           (df_du['Component Description'].astype(str).str.upper().str.contains("_GRID")))]
+    # バルク（_CU または _GRID）資材の抽出とCUマスタ展開
+    matched_du_cu = matched_du[
+        (matched_du['Component Description'].astype(str).str.upper().str.contains("_CU", na=False)) | 
+        (matched_du['Component Description'].astype(str).str.upper().str.contains("_GRID", na=False))
+    ]
     
     if not matched_du_cu.empty and df_cu is not None and not df_cu.empty:
-        cu_no = str(matched_du_cu.iloc[0]['Component Number']).strip()
-        matched_cu = df_cu[(df_cu['Parent material number'].astype(str).str.strip() == cu_no) & 
-                           (df_cu['Component Description'].astype(str).str.upper().str.contains("PC"))]
-        
-        for _, row in matched_cu.iterrows():
-            c_no = str(row['Component Number']).strip()
-            c_desc = str(row['Component Description']).strip()
-            materials[c_no] = (c_desc, volume_pcs)
+        for _, du_row in matched_du_cu.iterrows():
+            cu_no = str(du_row['Component Number']).strip()
+            
+            matched_cu = df_cu[(df_cu['Parent material number'].astype(str).str.strip() == cu_no)]
+            for _, cu_row in matched_cu.iterrows():
+                c_no = str(cu_row['Component Number']).strip()
+                c_desc = str(cu_row['Component Description']).strip()
+                materials[c_no] = (c_desc, volume_pcs)
             
     return materials
 
-# --- UI Layout (All Elements on Main Screen) ---
+# --- UI レイアウト (すべてメイン画面配置) ---
 st.set_page_config(layout="wide", page_title="Weekly Production & Material Report")
 st.title("🏭 Weekly Production Master & Hourly Material Report Generator")
 
@@ -372,72 +382,7 @@ if uploaded_file:
                     
                     volume_matrix_data.append({'line': line, 'product': product, 'hourly_pcs': row_hourly_pcs})
 
-                # 4. Hourly_Materials Layout processing
+                # 4. Hourly_Materials Processing With Text Substring Matching Fix
                 if df_cu is not None and df_du is not None:
                     ws_mat = wb.create_sheet("Hourly_Materials")
-                    ws_mat.cell(1, 1, "Line").font = Font(bold=True)
-                    ws_mat.cell(1, 2, "Parent Product").font = Font(bold=True)
-                    ws_mat.cell(1, 3, "Material Code").font = Font(bold=True)
-                    ws_mat.cell(1, 4, "Material Description").font = Font(bold=True)
-                    
-                    for i, h_dt in enumerate(hour_list):
-                        next_h = h_dt + datetime.timedelta(hours=1)
-                        header_str = f"{h_dt.strftime('%m/%d %H:%M')}~{next_h.strftime('%H:%M')}"
-                        c3 = ws_mat.cell(1, 5 + i, header_str)
-                        c3.font = Font(bold=True); c3.alignment = Alignment(text_rotation=90, horizontal='center')
-                    
-                    mat_row_idx = 2
-                    for item in volume_matrix_data:
-                        line = item['line']
-                        product = item['product']
-                        hourly_pcs = item['hourly_pcs']
-                        
-                        sample_breakdown = explode_sku_to_materials(product, 10000, df_cu, df_du)
-                        
-                        for mat_code, (mat_desc, _) in sample_breakdown.items():
-                            ws_mat.cell(mat_row_idx, 1, line)
-                            ws_mat.cell(mat_row_idx, 2, product)
-                            ws_mat.cell(mat_row_idx, 3, mat_code)
-                            ws_mat.cell(mat_row_idx, 4, mat_desc)
-                            
-                            has_values = False
-                            for c_idx, pcs_val in enumerate(hourly_pcs):
-                                if pcs_val > 0:
-                                    current_breakdown = explode_sku_to_materials(product, pcs_val, df_cu, df_du)
-                                    if mat_code in current_breakdown:
-                                        actual_mat_qty = current_breakdown[mat_code][1]
-                                        if actual_mat_qty > 0:
-                                            cell_m = ws_mat.cell(mat_row_idx, 5 + c_idx, int(round(actual_mat_qty)))
-                                            cell_m.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-                                            has_values = True
-                                            
-                            if has_values:
-                                mat_row_idx += 1
-                            else:
-                                for clear_col in range(1, 5):
-                                    ws_mat.cell(mat_row_idx, clear_col, None)
-
-                # Format layout grid breaks
-                for ws in wb.worksheets:
-                    if ws.title == "Visual_Schedule": continue
-                    start_offset_col = 5 if ws.title == "Hourly_Materials" else 3
-                    for col_idx in range(start_offset_col, ws.max_column + 1):
-                        header = str(ws.cell(1, col_idx).value)
-                        if "00:00" in header:
-                            for r in range(1, ws.max_row + 1): 
-                                ws.cell(r, col_idx).border = Border(left=thick_black)
-
-                ws_vis = wb.create_sheet("Visual_Schedule")
-                img_for_excel = BytesIO(img_buf.getvalue())
-                ws_vis.add_image(openpyxl.drawing.image.Image(img_for_excel), 'B2')
-                
-                out_excel = BytesIO()
-                wb.save(out_excel)
-                
-                # --- Outputs Display ---
-                st.image(img_buf, use_container_width=True)
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button("📥 Save Production Excel Report", out_excel.getvalue(), f"Production_Report_{selected_week}.xlsx")
-                with col2:
-                    st.download_button("🖼️ Save Gantt Chart Image", img_buf.getvalue(), f"Gantt_{selected_week}.png")
+                    ws_mat.cell(1
