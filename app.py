@@ -212,7 +212,7 @@ def generate_plot(df_tasks, start_date, sg_cap_map, display_unit):
     buf = BytesIO(); plt.savefig(buf, format='png'); plt.close(); buf.seek(0)
     return buf
 
-# --- バグ修正版：BOM分解エンジン ---
+# --- BOM分解エンジン ---
 def explode_sku_to_materials(parent_sku, volume_pcs, df_cu, df_du):
     materials = {}
     if df_du is None or df_du.empty:
@@ -220,7 +220,6 @@ def explode_sku_to_materials(parent_sku, volume_pcs, df_cu, df_du):
         
     p_sku_clean = str(parent_sku).strip()
     
-    # 【修正点】数値インデックスではなく正確なカラム名文字でマッチングを実施
     matched_du_outer = df_du[(df_du['Parent material number'].astype(str).str.strip() == p_sku_clean) & 
                              (df_du['Component Description'].astype(str).str.upper().str.contains("OUTER"))]
     
@@ -235,7 +234,6 @@ def explode_sku_to_materials(parent_sku, volume_pcs, df_cu, df_du):
         except Exception:
             continue
 
-    # 【修正点】_CU、_GRID を含むレコードを名前基準で抽出
     matched_du_cu = df_du[(df_du['Parent material number'].astype(str).str.strip() == p_sku_clean) & 
                           ((df_du['Component Description'].astype(str).str.upper().str.contains("_CU")) | 
                            (df_du['Component Description'].astype(str).str.upper().str.contains("_GRID")))]
@@ -252,30 +250,32 @@ def explode_sku_to_materials(parent_sku, volume_pcs, df_cu, df_du):
             
     return materials
 
-# --- UI / メインロジック ---
+# --- UI Layout (All Elements on Main Screen) ---
 st.set_page_config(layout="wide", page_title="Weekly Production & Material Report")
 st.title("🏭 Weekly Production Master & Hourly Material Report Generator")
 
-# サイドバー配置
-st.sidebar.header("⚙️ 構成設定")
-display_unit = st.sidebar.radio("Dashboard Gantt Display Unit Mode:", ["Tonnage (t)", "Pieces (pcs)"])
+st.markdown("### ⚙️ 1. Configuration Settings")
+display_unit = st.radio("Dashboard Gantt Display Unit Mode:", ["Tonnage (t)", "Pieces (pcs)"], horizontal=True)
 
-st.sidebar.markdown("---")
-st.sidebar.header("📦 SAP 資材分解用マスター (必須)")
-cu_file = st.sidebar.file_uploader("CU一覧ファイルをアップロード (.xlsx)", type=["xlsx", "csv"])
-du_file = st.sidebar.file_uploader("DU一覧ファイルをアップロード (.xlsx)", type=["xlsx", "csv"])
+st.markdown("---")
+st.markdown("### 📦 2. SAP Material Breakdown Masters (Required for Hourly_Materials)")
+col_cu, col_du = st.columns(2)
+with col_cu:
+    cu_file = st.file_uploader("Upload CU BOM List File (.xlsx or .csv)", type=["xlsx", "csv"])
+with col_du:
+    du_file = st.file_uploader("Upload DU BOM List File (.xlsx or .csv)", type=["xlsx", "csv"])
 
-st.markdown("### 1. 生産計画マスターファイルの読み込み")
-uploaded_file = st.file_uploader("Excelファイルをアップロード (.xlsm)", type=["xlsm"])
+st.markdown("---")
+st.markdown("### 🗓️ 3. Weekly Schedule Plan")
+uploaded_file = st.file_uploader("Upload Schedule Plan File (.xlsm)", type=["xlsm"])
 
 if uploaded_file:
     df_raw = pd.read_excel(uploaded_file, sheet_name='Fill', header=None)
     sg_cap_map = load_sg_cap_mappings(uploaded_file)
     
     if sg_cap_map:
-        st.sidebar.success(f"Loaded {len(sg_cap_map)} entries from SG-CAP!")
+        st.success(f"Successfully loaded {len(sg_cap_map)} product factor entries from 'SG-CAP' sheet.")
         
-    # 各種拡張子に対応した読み込み処理
     if cu_file:
         if cu_file.name.endswith('.csv'): df_cu = pd.read_csv(cu_file)
         else: df_cu = pd.read_excel(cu_file)
@@ -287,13 +287,15 @@ if uploaded_file:
     else: df_du = None
     
     if df_cu is not None and df_du is not None:
-        st.sidebar.success("✅ SAP CU & DU マスターを検知しました！")
+        st.info("✅ SAP CU & DU Masters parsed successfully! Material breaking logic activated.")
+    else:
+        st.warning("⚠️ CU or DU file is missing. The 'Hourly_Materials' sheet will not map accurately without them.")
 
     available_weeks = get_available_weeks(df_raw)
     if available_weeks:
-        selected_week = st.selectbox("対象週を選択", available_weeks)
-        if st.button("🚀 レポート生成開始"):
-            with st.spinner('データを最適化処理中...'):
+        selected_week = st.selectbox("Select Target Week:", available_weeks)
+        if st.button("🚀 Run Analysis & Generate Report"):
+            with st.spinner('Calculating matrix layouts and parsing child components...'):
                 df_tasks = process_tasks(df_raw)
                 img_buf = generate_plot(df_tasks, selected_week, sg_cap_map, display_unit)
                 
@@ -310,13 +312,11 @@ if uploaded_file:
                 wb = openpyxl.Workbook()
                 thick_black = Side(style='thick', color='000000')
                 
-                # 1. Hourly_Volume sheet setup
                 ws_vol = wb.active
                 ws_vol.title = "Hourly_Volume"
                 ws_vol.cell(1, 1, "Line").font = Font(bold=True)
                 ws_vol.cell(1, 2, "Product").font = Font(bold=True)
                 
-                # 2. Hourly_Pieces sheet setup
                 ws_pcs = wb.create_sheet("Hourly_Pieces")
                 ws_pcs.cell(1, 1, "Line").font = Font(bold=True)
                 ws_pcs.cell(1, 2, "Product").font = Font(bold=True)
@@ -372,7 +372,7 @@ if uploaded_file:
                     
                     volume_matrix_data.append({'line': line, 'product': product, 'hourly_pcs': row_hourly_pcs})
 
-                # 3. Hourly_Materials 出力
+                # 4. Hourly_Materials Layout processing
                 if df_cu is not None and df_du is not None:
                     ws_mat = wb.create_sheet("Hourly_Materials")
                     ws_mat.cell(1, 1, "Line").font = Font(bold=True)
@@ -417,7 +417,7 @@ if uploaded_file:
                                 for clear_col in range(1, 5):
                                     ws_mat.cell(mat_row_idx, clear_col, None)
 
-                # 罫線レイアウト調整
+                # Format layout grid breaks
                 for ws in wb.worksheets:
                     if ws.title == "Visual_Schedule": continue
                     start_offset_col = 5 if ws.title == "Hourly_Materials" else 3
@@ -427,7 +427,6 @@ if uploaded_file:
                             for r in range(1, ws.max_row + 1): 
                                 ws.cell(r, col_idx).border = Border(left=thick_black)
 
-                # 4. Visual_Schedule シート設置
                 ws_vis = wb.create_sheet("Visual_Schedule")
                 img_for_excel = BytesIO(img_buf.getvalue())
                 ws_vis.add_image(openpyxl.drawing.image.Image(img_for_excel), 'B2')
@@ -435,10 +434,10 @@ if uploaded_file:
                 out_excel = BytesIO()
                 wb.save(out_excel)
                 
-                # --- 結果表示 ---
+                # --- Outputs Display ---
                 st.image(img_buf, use_container_width=True)
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.download_button("📥 Excelレポートを保存", out_excel.getvalue(), f"Production_Report_{selected_week}.xlsx")
+                    st.download_button("📥 Save Production Excel Report", out_excel.getvalue(), f"Production_Report_{selected_week}.xlsx")
                 with col2:
-                    st.download_button("🖼️ ガントチャート画像を保存", img_buf.getvalue(), f"Gantt_{selected_week}.png")
+                    st.download_button("🖼️ Save Gantt Chart Image", img_buf.getvalue(), f"Gantt_{selected_week}.png")
